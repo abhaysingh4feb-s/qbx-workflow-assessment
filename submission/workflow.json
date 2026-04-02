@@ -1,0 +1,225 @@
+{
+  "id": "incident-notifier-001",
+  "name": "Incident Notifier",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "incident",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "1",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 300],
+      "webhookId": "incident-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst incident = raw.body || raw;\n\n// --- Validation ---\nconst required = ['incidentId', 'severity', 'title', 'createdAt'];\nconst missing = required.filter(k => !incident[k]);\nif (missing.length > 0) {\n  return [{\n    json: {\n      _valid: false,\n      error: `Missing required fields: ${missing.join(', ')}`,\n      incidentId: incident.incidentId || 'unknown'\n    }\n  }];\n}\n\nconst sevMap = { P1: 1, P2: 2, P3: 3, P4: 4 };\nconst severityRank = sevMap[incident.severity];\nif (!severityRank) {\n  return [{\n    json: {\n      _valid: false,\n      error: `Invalid severity: ${incident.severity}. Expected P1-P4.`,\n      incidentId: incident.incidentId\n    }\n  }];\n}\n\n// --- Normalize ---\nconst trunc = (s, n = 240) => (s || '').length > n ? s.slice(0, n - 3) + '...' : (s || '');\nconst correlationId = incident.metadata?.correlationId || '';\nconst dedupeKey = `${incident.incidentId}|${incident.severity}|${incident.title}`;\nconst ownerEmail = incident.ownerEmail || 'oncall@example.com';\nconst descriptionShort = trunc(incident.description, 240);\n\n// --- Build Slack payload ---\nconst slackPayload = {\n  channel: '#oncall-alerts',\n  text: `[${incident.severity}] ${incident.incidentId} \\u2014 ${incident.title} (corr=${correlationId})`\n};\n\n// --- Build O365 email payload ---\nconst emailPayload = {\n  message: {\n    subject: `[${incident.severity}] ${incident.incidentId} \\u2014 ${incident.title}`,\n    body: {\n      contentType: 'Text',\n      content: `${descriptionShort}\\n\\nCorrelationId: ${correlationId}\\nCreatedAt: ${incident.createdAt}`\n    },\n    toRecipients: [{ emailAddress: { address: ownerEmail } }]\n  },\n  saveToSentItems: false\n};\n\nreturn [{\n  json: {\n    _valid: true,\n    incidentId: incident.incidentId,\n    severity: incident.severity,\n    severityRank,\n    title: incident.title,\n    descriptionShort,\n    correlationId,\n    createdAt: incident.createdAt,\n    ownerEmail,\n    dedupeKey,\n    slackPayload,\n    emailPayload\n  }\n}];"
+      },
+      "id": "2",
+      "name": "Normalize Incident",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-valid",
+              "leftValue": "={{ $json._valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "3",
+      "name": "IF Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [700, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nif (!staticData.failureLog) staticData.failureLog = [];\n\nconst data = $input.first().json;\n\nstaticData.failureLog.push({\n  timestamp: new Date().toISOString(),\n  incidentId: data.incidentId || 'unknown',\n  channel: 'validation',\n  error: data.error\n});\n\nreturn [{\n  json: {\n    status: 'error',\n    reason: 'validation_failed',\n    incidentId: data.incidentId || 'unknown',\n    error: data.error\n  }\n}];"
+      },
+      "id": "4",
+      "name": "Handle Validation Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [950, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nif (!staticData.dedupeStore) staticData.dedupeStore = {};\n\nconst data = $input.first().json;\nconst isDuplicate = !!staticData.dedupeStore[data.dedupeKey];\n\nreturn [{\n  json: {\n    ...data,\n    _deduplicated: isDuplicate\n  }\n}];"
+      },
+      "id": "5",
+      "name": "Check Idempotency",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [950, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-dedupe",
+              "leftValue": "={{ $json._deduplicated }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6",
+      "name": "IF Duplicate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1200, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\nreturn [{\n  json: {\n    status: 'skipped',\n    reason: 'duplicate',\n    incidentId: data.incidentId,\n    dedupeKey: data.dedupeKey,\n    message: `Incident ${data.incidentId} already processed. Skipping.`\n  }\n}];"
+      },
+      "id": "7",
+      "name": "Return Duplicate Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1450, 520]
+    },
+    {
+      "parameters": {
+        "jsCode": "const axios = require('axios');\n\n// --- Configuration ---\nconst MAX_ATTEMPTS = 5;\nconst BASE_DELAY_MS = 500;\n\nfunction sleep(ms) {\n  return new Promise(resolve => setTimeout(resolve, ms));\n}\n\nfunction shouldRetry(statusCode) {\n  return statusCode === 429 || (statusCode >= 500 && statusCode <= 599);\n}\n\nasync function sendWithRetry(url, token, payload, channelName) {\n  let lastStatus = null;\n  let lastBody = null;\n\n  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {\n    try {\n      const res = await axios.post(url, payload, {\n        headers: {\n          'Authorization': `Bearer ${token}`,\n          'Content-Type': 'application/json'\n        },\n        validateStatus: () => true\n      });\n\n      lastStatus = res.status;\n      lastBody = res.data || null;\n\n      // Success (2xx)\n      if (res.status >= 200 && res.status < 300) {\n        return {\n          success: true,\n          channel: channelName,\n          status: res.status,\n          body: lastBody,\n          attempts: attempt\n        };\n      }\n\n      // Non-retryable 4xx (except 429)\n      if (!shouldRetry(res.status)) {\n        return {\n          success: false,\n          channel: channelName,\n          status: res.status,\n          body: lastBody,\n          attempts: attempt,\n          retryable: false\n        };\n      }\n\n      // Retryable (429 or 5xx) -- backoff before next attempt\n    } catch (err) {\n      lastBody = err.message;\n    }\n\n    if (attempt < MAX_ATTEMPTS) {\n      const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);\n      await sleep(delay);\n    }\n  }\n\n  return {\n    success: false,\n    channel: channelName,\n    status: lastStatus,\n    body: lastBody,\n    attempts: MAX_ATTEMPTS,\n    exhausted: true\n  };\n}\n\n// --- Execute both channels in parallel ---\nconst data = $input.first().json;\n\nconst [slackResult, o365Result] = await Promise.allSettled([\n  sendWithRetry(\n    'http://localhost:4010/chat.postMessage',\n    'slack-test-token',\n    data.slackPayload,\n    'slack'\n  ),\n  sendWithRetry(\n    'http://localhost:4020/me/sendMail',\n    'ms-test-token',\n    data.emailPayload,\n    'o365'\n  )\n]);\n\nreturn [{\n  json: {\n    ...data,\n    slackResult: slackResult.status === 'fulfilled'\n      ? slackResult.value\n      : { success: false, channel: 'slack', error: slackResult.reason?.message },\n    o365Result: o365Result.status === 'fulfilled'\n      ? o365Result.value\n      : { success: false, channel: 'o365', error: o365Result.reason?.message }\n  }\n}];"
+      },
+      "id": "8",
+      "name": "Send Notifications",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1450, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nif (!staticData.dedupeStore) staticData.dedupeStore = {};\nif (!staticData.failureLog) staticData.failureLog = [];\n\nconst data = $input.first().json;\nconst slackOk = data.slackResult?.success === true;\nconst o365Ok = data.o365Result?.success === true;\n\n// --- Persist failures ---\nif (!slackOk) {\n  staticData.failureLog.push({\n    timestamp: new Date().toISOString(),\n    incidentId: data.incidentId,\n    dedupeKey: data.dedupeKey,\n    channel: 'slack',\n    lastStatus: data.slackResult?.status,\n    attempts: data.slackResult?.attempts,\n    error: data.slackResult?.body\n  });\n}\nif (!o365Ok) {\n  staticData.failureLog.push({\n    timestamp: new Date().toISOString(),\n    incidentId: data.incidentId,\n    dedupeKey: data.dedupeKey,\n    channel: 'o365',\n    lastStatus: data.o365Result?.status,\n    attempts: data.o365Result?.attempts,\n    error: data.o365Result?.body\n  });\n}\n\n// --- Record dedupe ONLY if both succeeded ---\nif (slackOk && o365Ok) {\n  staticData.dedupeStore[data.dedupeKey] = {\n    processedAt: new Date().toISOString(),\n    incidentId: data.incidentId\n  };\n}\n\nreturn [{\n  json: {\n    status: slackOk && o365Ok ? 'success' : 'partial_failure',\n    incidentId: data.incidentId,\n    dedupeKey: data.dedupeKey,\n    slack: slackOk ? 'sent' : 'failed',\n    o365: o365Ok ? 'sent' : 'failed',\n    slackResult: data.slackResult,\n    o365Result: data.o365Result\n  }\n}];"
+      },
+      "id": "9",
+      "name": "Process Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1700, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Incident": {
+      "main": [
+        [
+          {
+            "node": "IF Valid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Valid": {
+      "main": [
+        [
+          {
+            "node": "Check Idempotency",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Validation Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Idempotency": {
+      "main": [
+        [
+          {
+            "node": "IF Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Return Duplicate Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Notifications": {
+      "main": [
+        [
+          {
+            "node": "Process Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1"
+}
